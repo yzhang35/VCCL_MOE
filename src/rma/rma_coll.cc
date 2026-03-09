@@ -15,6 +15,32 @@
 
 typedef ncclResult_t (*NcclRmaFunc_t)(struct ncclComm*, ncclRmaWork*, cudaStream_t);
 
+// Helper function to dump one RMA task
+static void dumpNcclTaskRma(const struct ncclTaskRma* task, int stIdx = 0) {
+  if (task == nullptr) {
+    printf("    Task: NULL\n");
+    return;
+  }
+
+  printf("    Task on streamIdx=%d: func=%s(%d) ctx=%d count=%zu dtype=%s bytes=%zu peer=%d signal=%d npeers=%d\n",
+         stIdx, ncclFuncToString(task->func), task->func, task->ctx, task->count,
+         ncclDatatypeToString(task->datatype), task->bytes, task->peer,
+         task->signalMode, task->npeers);
+  /*
+  printf("      srcBuff=%p srcWinHost=%p srcWinOffset=%zu\n",
+         task->srcBuff, task->srcWinHost, task->srcWinOffset);
+  printf("      peerWinHost=%p peerWinOffset=%zu\n",
+         task->peerWinHost, task->peerWinOffset);
+  */
+  if (task->npeers > 0 && task->peers && task->nsignals) {
+    printf("      peers/nsignals:");
+    for (int i = 0; i < task->npeers; i++) {
+      printf(" (%d,%d)", task->peers[i], task->nsignals[i]);
+    }
+    printf("\n");
+  }
+}
+
 // Helper function to dump RMA task queue
 static void dumpRmaTaskQueue(const char* name,
                              struct ncclIntruQueue<struct ncclTaskRma, &ncclTaskRma::next>* queue) {
@@ -27,21 +53,7 @@ static void dumpRmaTaskQueue(const char* name,
   printf("  %s: %d\n", name, count);
   task = ncclIntruQueueHead(queue);
   while (task != nullptr) {
-    printf("    Task: func=%s(%d) ctx=%d count=%zu dtype=%s bytes=%zu peer=%d signal=%d npeers=%d\n",
-           ncclFuncToString(task->func), task->func, task->ctx, task->count,
-           ncclDatatypeToString(task->datatype), task->bytes, task->peer,
-           task->signalMode, task->npeers);
-    printf("      srcBuff=%p srcWinHost=%p srcWinOffset=%zu\n",
-           task->srcBuff, task->srcWinHost, task->srcWinOffset);
-    printf("      peerWinHost=%p peerWinOffset=%zu\n",
-           task->peerWinHost, task->peerWinOffset);
-    if (task->npeers > 0 && task->peers && task->nsignals) {
-      printf("      peers/nsignals:");
-      for (int i = 0; i < task->npeers; i++) {
-        printf(" (%d,%d)", task->peers[i], task->nsignals[i]);
-      }
-      printf("\n");
-    }
+    dumpNcclTaskRma(task);
     task = task->next;
   }
 }
@@ -130,14 +142,15 @@ static ncclResult_t launchRmaOpHelper(struct ncclComm* comm, struct ncclRmaCollS
   tmpWork.rmaArgs = rmaArgs;
   setWorkField(tmpWork);
 
-  if (opCnt == 0) {
+  if (0) {
     // First operation: launch on main stream
     NCCLCHECK(func(comm, &tmpWork, mainStream));
   } else {
     // Subsequent operations: launch on separate rmaCollStream with synchronization
-    cudaStream_t opStream = rmaCollState->rmaCollStream[opCnt - 1];
+    cudaStream_t opStream = rmaCollState->rmaCollStream[opCnt];
     assert(opEvent != nullptr);
     CUDACHECK(cudaStreamWaitEvent(opStream, opEvent, 0));
+    dumpNcclTaskRma(ncclIntruQueueHead(&tmpWork.rmaTaskQueueCe), opCnt);
     NCCLCHECK(func(comm, &tmpWork, opStream));
   }
   opCnt++;
@@ -190,6 +203,12 @@ ncclResult_t ncclLaunchRmaColl(struct ncclComm* comm, struct ncclKernelPlan* pla
 
   // Iterate through each RMA work batch
   struct ncclRmaWorkBatch* batch = ncclIntruQueueHead(&plan->rmaWorkBatchQueue);
+
+  cudaEvent_t batchStartEvent = nullptr;
+  // Use a dedicated event slot that is not used by per-stream completion sync.
+  batchStartEvent = rmaCollState->rmaCollEvent[NCCL_RMA_COLL_MAX_STREAMS - 1];
+  CUDACHECKGOTO(cudaEventRecord(batchStartEvent, mainStream), ret, fail);
+
   while (batch != nullptr) {
     NVTX3_FUNC_WITH_PARAMS(RmaColl, NcclNvtxParamsRmaColl,
       NVTX3_PAYLOAD(batch->logId, batch->batchIdx,
@@ -204,75 +223,77 @@ ncclResult_t ncclLaunchRmaColl(struct ncclComm* comm, struct ncclKernelPlan* pla
 
     // Record one batch-level start event on main stream and reuse it for all
     // secondary operation launches in this batch.
-    int activeOps = 0;
-    activeOps += (batch->nProxyPut > 0);
-    activeOps += (batch->nProxyWaitSignal > 0);
-    activeOps += batch->nCePut;
-    activeOps += (batch->nCeWaitSignal > 0);
-    cudaEvent_t batchStartEvent = nullptr;
-    if (activeOps > 1) {
-      // Use a dedicated event slot that is not used by per-stream completion sync.
-      batchStartEvent = rmaCollState->rmaCollEvent[NCCL_RMA_COLL_MAX_STREAMS - 1];
-      CUDACHECKGOTO(cudaEventRecord(batchStartEvent, mainStream), ret, fail);
+    int ceWaitSignalOpCount = 0;
+    for (struct ncclTaskRma* ceWaitTask = ncclIntruQueueHead(&batch->ceWaitSignalQueue);
+         ceWaitTask != nullptr; ceWaitTask = ceWaitTask->next) {
+      ceWaitSignalOpCount += ceWaitTask->npeers;
     }
-
+    assert(batch->nCePut == ceWaitSignalOpCount);
+    assert(batch->nProxyPut + batch->nProxyWaitSignal == 0);
     // Launch the four types of RMA operations in parallel:
-    // 1. ProxyPut
-    NCCLCHECKGOTO(launchRmaOpHelper(comm, rmaCollState, rmaArgs, mainStream,
-      batch->nProxyPut,
-      ncclRmaPutProxy,
-      [&](ncclRmaWork& w) {
-        w.rmaArgs->runParallel = 0; // rmaTasks in ProxyPut are run sequentially
-        w.rmaArgs->nRmaTasksProxy = batch->nProxyPut;
-        w.rmaTaskQueueProxy = batch->proxyPutQueue;
-      },
-      batchStartEvent, opCnt), ret, fail);
-
-    // 2. ProxyWaitSignal
-    NCCLCHECKGOTO(launchRmaOpHelper(comm, rmaCollState, rmaArgs, mainStream,
-      batch->nProxyWaitSignal,
-      ncclRmaWaitSignalProxy,
-      [&](ncclRmaWork& w) {
-        w.rmaArgs->nRmaTasksProxy = batch->nProxyWaitSignal;
-        w.rmaTaskQueueProxy = batch->proxyWaitSignalQueue;
-      },
-      batchStartEvent, opCnt), ret, fail);
-
     // 3. CePut
-    for (int cePutIdx = 0; cePutIdx < batch->nCePut; cePutIdx++) {
-      struct ncclTaskRma* cePutTask = ncclIntruQueueDequeue(&batch->cePutQueue);
+    struct ncclTaskRma* cePutTask = ncclIntruQueueHead(&batch->cePutQueue);
+    ncclIntruQueueConstruct(&batch->cePutQueue);
+    while (cePutTask != nullptr) {
+      struct ncclTaskRma* nextCePutTask = cePutTask->next;
+      cePutTask->next = nullptr;
+      opCnt = cePutTask->peer;
+      cePutTask->ctx = opCnt;
       NCCLCHECKGOTO(launchRmaOpHelper(comm, rmaCollState, rmaArgs, mainStream,
         1,
         ncclRmaPutCe,
         [&](ncclRmaWork& w) {
           w.rmaArgs->nRmaTasksCe = 1;
+          w.rmaArgs->ctx = opCnt;
           ncclIntruQueueConstruct(&w.rmaTaskQueueCe);
           ncclIntruQueueEnqueue(&w.rmaTaskQueueCe, cePutTask);
         },
         batchStartEvent, opCnt), ret, fail);
+      cePutTask = nextCePutTask;
     }
 
     // 4. CeWaitSignal
-    NCCLCHECKGOTO(launchRmaOpHelper(comm, rmaCollState, rmaArgs, mainStream,
-      batch->nCeWaitSignal,
-      ncclRmaWaitSignalCe,
-      [&](ncclRmaWork& w) {
-        w.rmaArgs->nRmaTasksCe = batch->nCeWaitSignal;
-        w.rmaTaskQueueCe = batch->ceWaitSignalQueue;
-      },
-      batchStartEvent, opCnt), ret, fail);
+    struct ncclTaskRma* ceWaitTask = ncclIntruQueueHead(&batch->ceWaitSignalQueue);
+    ncclIntruQueueConstruct(&batch->ceWaitSignalQueue);
+    while (ceWaitTask != nullptr) {
+      struct ncclTaskRma* nextCeWaitTask = ceWaitTask->next;
+      ceWaitTask->next = nullptr;
+      for (int peerIdx = 0; peerIdx < ceWaitTask->npeers; peerIdx++) {
+        struct ncclTaskRma* splitCeWaitTask = ncclMemoryPoolAlloc<struct ncclTaskRma>(&comm->memPool_ncclTaskRma, &comm->memPermanent);
+        *splitCeWaitTask = *ceWaitTask;
+        splitCeWaitTask->next = nullptr;
+        splitCeWaitTask->npeers = 1;
+        splitCeWaitTask->ctx = ceWaitTask->peers[peerIdx];
+        opCnt = splitCeWaitTask->ctx;
+        splitCeWaitTask->peers = ncclMemoryStackAlloc<int>(&comm->memPermanent, 1);
+        memcpy(splitCeWaitTask->peers, ceWaitTask->peers + peerIdx, sizeof(int));
+        splitCeWaitTask->nsignals = ncclMemoryStackAlloc<int>(&comm->memPermanent, 1);
+        memcpy(splitCeWaitTask->nsignals, ceWaitTask->nsignals + peerIdx, sizeof(int));
 
-    // Synchronize all secondary streams back to main stream
-    for (int idx = 0; idx < opCnt - 1; idx++) {
-      cudaStream_t workStream = rmaCollState->rmaCollStream[idx];
-      cudaEvent_t workEvent = rmaCollState->rmaCollEvent[idx];
-      CUDACHECKGOTO(cudaEventRecord(workEvent, workStream), ret, fail);
-      CUDACHECKGOTO(cudaStreamWaitEvent(mainStream, workEvent, 0), ret, fail);
+        NCCLCHECKGOTO(launchRmaOpHelper(comm, rmaCollState, rmaArgs, mainStream,
+          1,
+          ncclRmaWaitSignalCe,
+          [&](ncclRmaWork& w) {
+            w.rmaArgs->nRmaTasksCe = 1;
+            w.rmaArgs->ctx = opCnt;
+            ncclIntruQueueConstruct(&w.rmaTaskQueueCe);
+            ncclIntruQueueEnqueue(&w.rmaTaskQueueCe, splitCeWaitTask);
+          },
+          batchStartEvent, opCnt), ret, fail);
+      }
+      ncclMemoryPoolFree(&comm->memPool_ncclTaskRma, ceWaitTask);
+      ceWaitTask = nextCeWaitTask;
     }
     // Move to next batch
     batch = batch->next;
   }
-
+  // Synchronize all secondary streams back to main stream
+  for (int idx = 0; idx < comm->localRanks; idx++) {
+    cudaStream_t workStream = rmaCollState->rmaCollStream[idx];
+    cudaEvent_t workEvent = rmaCollState->rmaCollEvent[idx];
+    CUDACHECKGOTO(cudaEventRecord(workEvent, workStream), ret, fail);
+    CUDACHECKGOTO(cudaStreamWaitEvent(mainStream, workEvent, 0), ret, fail);
+  }
 exit:
   if (rmaArgs) free(rmaArgs);
   return ret;
