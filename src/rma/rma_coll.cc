@@ -184,6 +184,17 @@ struct ncclRmaCollSchedule {
   struct ncclRmaWorkBatch* batchesHead;
 };
 
+constexpr int RMA_MAX_LOCAL_RANKS = 8;
+int calcOpCnt(int self, int peer) {
+  if (self == peer) {
+    return 0;
+  }
+  if (self != RMA_MAX_LOCAL_RANKS - 1 && peer != RMA_MAX_LOCAL_RANKS - 1) {
+    return (self + peer) % (RMA_MAX_LOCAL_RANKS - 1) + 1;
+  } else {
+    return (2 * self + 2 * peer) % (RMA_MAX_LOCAL_RANKS - 1) + 1;
+  }
+}
 
 ncclResult_t ncclLaunchRmaColl(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   ncclResult_t ret = ncclSuccess;
@@ -237,7 +248,7 @@ ncclResult_t ncclLaunchRmaColl(struct ncclComm* comm, struct ncclKernelPlan* pla
     while (cePutTask != nullptr) {
       struct ncclTaskRma* nextCePutTask = cePutTask->next;
       cePutTask->next = nullptr;
-      opCnt = cePutTask->peer;
+      opCnt = calcOpCnt(comm->rank, cePutTask->peer);
       cePutTask->ctx = opCnt;
       NCCLCHECKGOTO(launchRmaOpHelper(comm, rmaCollState, rmaArgs, mainStream,
         1,
@@ -263,8 +274,8 @@ ncclResult_t ncclLaunchRmaColl(struct ncclComm* comm, struct ncclKernelPlan* pla
         *splitCeWaitTask = *ceWaitTask;
         splitCeWaitTask->next = nullptr;
         splitCeWaitTask->npeers = 1;
-        splitCeWaitTask->ctx = ceWaitTask->peers[peerIdx];
-        opCnt = splitCeWaitTask->ctx;
+        opCnt = calcOpCnt(comm->rank, ceWaitTask->peers[peerIdx]);
+        splitCeWaitTask->ctx = opCnt;
         splitCeWaitTask->peers = ncclMemoryStackAlloc<int>(&comm->memPermanent, 1);
         memcpy(splitCeWaitTask->peers, ceWaitTask->peers + peerIdx, sizeof(int));
         splitCeWaitTask->nsignals = ncclMemoryStackAlloc<int>(&comm->memPermanent, 1);
