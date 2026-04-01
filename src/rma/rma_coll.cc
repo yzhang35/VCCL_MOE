@@ -150,7 +150,7 @@ static ncclResult_t launchRmaOpHelper(struct ncclComm* comm, struct ncclRmaCollS
     cudaStream_t opStream = rmaCollState->rmaCollStream[opCnt];
     assert(opEvent != nullptr);
     CUDACHECK(cudaStreamWaitEvent(opStream, opEvent, 0));
-    dumpNcclTaskRma(ncclIntruQueueHead(&tmpWork.rmaTaskQueueCe), opCnt);
+    //dumpNcclTaskRma(ncclIntruQueueHead(&tmpWork.rmaTaskQueueCe), opCnt);
     NCCLCHECK(func(comm, &tmpWork, opStream));
   }
   opCnt++;
